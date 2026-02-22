@@ -23,6 +23,7 @@ REFRESH_SECONDS = 60
 QUOTE_ASSET = "USDT"
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+COINGLASS_BASE = "https://open-api-v4.coinglass.com"
 BINANCE_FAPI = "https://fapi.binance.com"
 BINANCE_MARKPRICE_ARR_WS = "wss://fstream.binance.com/ws/!markPrice@arr@1s"
 
@@ -138,6 +139,7 @@ class Store:
 
         # 狀態（給前端）
         self.quality: Dict[str, str] = {
+            "coinglass": "未開始",
             "coingecko": "未開始",
             "binance": "未開始",
             "binance_ws": "未開始",
@@ -216,6 +218,14 @@ def coingecko_headers() -> Dict[str, str]:
     return {"x-cg-demo-api-key": key, "User-Agent": "top100-monitor/2.4.1"}
 
 
+def coinglass_headers() -> Dict[str, str]:
+    key = (os.getenv("COINGLASS_API_KEY") or "").strip()
+    headers = {"User-Agent": "top100-monitor/2.4.1"}
+    if key:
+        headers["CG-API-KEY"] = key
+    return headers
+
+
 async def safe_get_json(
     client: httpx.AsyncClient,
     url: str,
@@ -246,6 +256,98 @@ async def safe_get_json(
 def snapshot_from_store(ts: int) -> List[dict]:
     rows = sorted(store.rows.values(), key=lambda x: x.rank)
     return [asdict(r) for r in rows]
+
+
+def _first_num(obj: dict, keys: List[str]) -> Optional[float]:
+    for k in keys:
+        if k in obj and obj[k] is not None:
+            try:
+                return float(obj[k])
+            except Exception:
+                continue
+    return None
+
+
+async def fetch_coinglass_futures_coins_markets(client: httpx.AsyncClient) -> Tuple[Optional[List[dict]], Optional[str]]:
+    data, err = await safe_get_json(
+        client,
+        f"{COINGLASS_BASE}/api/futures/coins-markets",
+        params={},
+        timeout=20,
+        retries=2,
+    )
+    if err:
+        return None, err
+    if not isinstance(data, dict):
+        return None, "回傳格式不是 dict"
+    code = str(data.get("code", ""))
+    if code not in ("0", "200", ""):
+        return None, f"code={code}, msg={data.get('msg')}"
+    rows = data.get("data")
+    if not isinstance(rows, list):
+        return None, "data 不是 list"
+    return rows, None
+
+
+def build_rows_from_coinglass_markets(rows_data: List[dict], now: int) -> List[Row]:
+    filtered: List[dict] = []
+    for item in rows_data:
+        sym = str(item.get("symbol") or "").upper().strip()
+        if not sym or is_stablecoin_symbol(sym):
+            continue
+        filtered.append(item)
+
+    filtered.sort(
+        key=lambda x: (_first_num(x, ["market_cap_usd", "marketCapUsd", "market_cap"]) or 0.0),
+        reverse=True,
+    )
+
+    rows: List[Row] = []
+    for idx, item in enumerate(filtered[:100], start=1):
+        sym = str(item.get("symbol") or "").upper().strip()
+        old = store.rows.get(sym)
+
+        price = _first_num(item, ["current_price", "price", "price_usd"]) or 0.0
+        mcap = _first_num(item, ["market_cap_usd", "marketCapUsd", "market_cap"]) or 0.0
+        chg_1h = _first_num(item, ["price_change_percent_1h", "price_change_percentage_1h"])
+        chg_24h = _first_num(item, ["price_change_percent_24h", "price_change_percentage_24h"])
+
+        r = Row(
+            rank=idx,
+            symbol=sym,
+            price_usd=price,
+            market_cap_usd=mcap,
+            chg_1h_pct=chg_1h,
+            chg_24h_pct=chg_24h,
+            binance_symbol=None,
+            updated_at=now,
+        )
+
+        # Coinglass coins-markets can directly provide some futures metrics.
+        r.funding_rate_now = _first_num(item, ["avg_funding_rate_by_oi", "avg_funding_rate_by_vol", "funding_rate"])
+        r.open_interest_now = _first_num(item, ["open_interest_usd", "openInterestUsd", "open_interest"])
+        r.ls_ratio_now = _first_num(item, ["global_long_short_account_ratio", "long_short_ratio", "ls_ratio"])
+
+        if old is not None:
+            # Preserve history-derived fields if source doesn't provide them this round.
+            if r.funding_settle_delta_8h is None:
+                r.funding_settle_delta_8h = old.funding_settle_delta_8h
+            if r.ls_ratio_now is None:
+                r.ls_ratio_now = old.ls_ratio_now
+            if r.ls_ratio_chg_1h is None:
+                r.ls_ratio_chg_1h = old.ls_ratio_chg_1h
+            if r.open_interest_now is None:
+                r.open_interest_now = old.open_interest_now
+            if r.open_interest_chg_1h is None:
+                r.open_interest_chg_1h = old.open_interest_chg_1h
+            if r.score_1to5 is None:
+                r.score_1to5 = old.score_1to5
+            if r.score_note is None:
+                r.score_note = old.score_note
+
+        rows.append(r)
+
+    return rows
 
 
 # =========================
@@ -616,25 +718,35 @@ async def binance_markprice_ws_loop():
 # =========================
 async def refresh_loop():
     headers = coingecko_headers()
+    use_coinglass = bool((os.getenv("COINGLASS_API_KEY") or "").strip())
 
     async with httpx.AsyncClient(headers=headers) as cg_client, httpx.AsyncClient(
+        headers=coinglass_headers()
+    ) as cgl_client, httpx.AsyncClient(
         headers={"User-Agent": "top100-monitor/2.4.1"}
     ) as bn_client:
-        # Binance mapping (best-effort; failure should not block CoinGecko rows)
-        try:
-            m, symbols_set, err = await fetch_binance_usdt_perp_mapping(bn_client)
-            if err:
-                store.base_to_usdt_perp = {}
-                store.usdt_perp_symbols = set()
-                store.quality["binance"] = f"映射失敗(已降級): {err[:80]}"
-            else:
-                store.base_to_usdt_perp = m
-                store.usdt_perp_symbols = symbols_set
-                store.quality["binance"] = "映射成功"
-        except Exception:
+        if use_coinglass:
             store.base_to_usdt_perp = {}
             store.usdt_perp_symbols = set()
-            store.quality["binance"] = "映射失敗(已降級): exception"
+            store.quality["binance"] = "停用（改用 CoinGlass）"
+            store.quality["coinglass"] = "已啟用"
+        else:
+            store.quality["coinglass"] = "未設定 API Key"
+            # Binance mapping (best-effort; failure should not block CoinGecko rows)
+            try:
+                m, symbols_set, err = await fetch_binance_usdt_perp_mapping(bn_client)
+                if err:
+                    store.base_to_usdt_perp = {}
+                    store.usdt_perp_symbols = set()
+                    store.quality["binance"] = f"映射失敗(已降級): {err[:80]}"
+                else:
+                    store.base_to_usdt_perp = m
+                    store.usdt_perp_symbols = symbols_set
+                    store.quality["binance"] = "映射成功"
+            except Exception:
+                store.base_to_usdt_perp = {}
+                store.usdt_perp_symbols = set()
+                store.quality["binance"] = "映射失敗(已降級): exception"
 
         sem = asyncio.Semaphore(BINANCE_CONCURRENCY)
 
@@ -648,10 +760,104 @@ async def refresh_loop():
                     age = now - store.ws_last_update_ts
                     store.quality["binance_ws"] = "已連線" if age <= 6 else f"已連線({age}s)"
 
-                # 1) CoinGecko
-                top, cg_err = await fetch_coingecko_top100(cg_client)
+                rows: List[Row] = []
+                source_used = ""
 
-                if top is None:
+                if use_coinglass:
+                    cgl_rows, cgl_err = await fetch_coinglass_futures_coins_markets(cgl_client)
+                    if cgl_rows is None:
+                        store.quality["coinglass"] = f"失敗: {str(cgl_err)[:90]}"
+                    else:
+                        rows = build_rows_from_coinglass_markets(cgl_rows, now)
+                        source_used = "coinglass"
+                        store.quality["coinglass"] = "成功"
+                        store.quality["coingecko"] = "停用（由 CoinGlass 提供）"
+
+                # 1) CoinGecko fallback / default source
+                if not rows:
+                    top, cg_err = await fetch_coingecko_top100(cg_client)
+
+                    if top is None:
+                        if use_coinglass:
+                            store.quality["coinglass"] = store.quality.get("coinglass", "失敗")
+                        if store.last_good_snapshot:
+                            store.quality["coingecko"] = "快取"
+                            await ws_manager.broadcast(
+                                {
+                                    "type": "snapshot",
+                                    "ts": store.last_good_ts,
+                                    "took_ms": 0,
+                                    "data": store.last_good_snapshot,
+                                    "quality": store.quality,
+                                }
+                            )
+                        else:
+                            store.quality["coingecko"] = "失敗"
+                            await ws_manager.broadcast(
+                                {
+                                    "type": "snapshot",
+                                    "ts": now,
+                                    "took_ms": int((time.time() - start) * 1000),
+                                    "data": [],
+                                    "quality": store.quality,
+                                }
+                            )
+                            await ws_manager.broadcast(
+                                {
+                                    "type": "error",
+                                    "message": f"CoinGecko 取資料失敗：{cg_err}",
+                                    "quality": store.quality,
+                                }
+                            )
+
+                        await asyncio.sleep(REFRESH_SECONDS)
+                        continue
+
+                    source_used = "coingecko"
+                    store.quality["coingecko"] = "成功"
+
+                    # 2) 建 100 行（刪穩定幣：只用白名單精準比對）
+                    for item in top:
+                        sym = str(item.get("symbol", "")).upper()
+
+                        if is_stablecoin_symbol(sym):
+                            continue
+
+                        rank = int(item.get("market_cap_rank") or 0)
+                        price = float(item.get("current_price") or 0.0)
+                        mcap = float(item.get("market_cap") or 0.0)
+
+                        chg_1h = item.get("price_change_percentage_1h_in_currency")
+                        chg_24h = item.get("price_change_percentage_24h_in_currency")
+                        chg_1h = float(chg_1h) if chg_1h is not None else None
+                        chg_24h = float(chg_24h) if chg_24h is not None else None
+
+                        bsymbol = map_to_binance_symbol(sym)
+                        old = store.rows.get(sym)
+                        r = Row(
+                            rank=rank,
+                            symbol=sym,
+                            price_usd=price,
+                            market_cap_usd=mcap,
+                            chg_1h_pct=chg_1h,
+                            chg_24h_pct=chg_24h,
+                            binance_symbol=bsymbol,
+                            updated_at=now,
+                        )
+
+                        if old is not None:
+                            r.funding_rate_now = old.funding_rate_now
+                            r.funding_settle_delta_8h = old.funding_settle_delta_8h
+                            r.ls_ratio_now = old.ls_ratio_now
+                            r.ls_ratio_chg_1h = old.ls_ratio_chg_1h
+                            r.open_interest_now = old.open_interest_now
+                            r.open_interest_chg_1h = old.open_interest_chg_1h
+                            r.score_1to5 = old.score_1to5
+                            r.score_note = old.score_note
+
+                        rows.append(r)
+
+                if not rows:
                     if store.last_good_snapshot:
                         store.quality["coingecko"] = "快取"
                         await ws_manager.broadcast(
@@ -664,7 +870,7 @@ async def refresh_loop():
                             }
                         )
                     else:
-                        store.quality["coingecko"] = "失敗"
+                        store.quality["coingecko"] = "失敗（來源回空）"
                         await ws_manager.broadcast(
                             {
                                 "type": "snapshot",
@@ -677,7 +883,7 @@ async def refresh_loop():
                         await ws_manager.broadcast(
                             {
                                 "type": "error",
-                                "message": f"CoinGecko 取資料失敗：{cg_err}",
+                                "message": "資料來源回空（CoinGlass/CoinGecko）",
                                 "quality": store.quality,
                             }
                         )
@@ -685,49 +891,7 @@ async def refresh_loop():
                     await asyncio.sleep(REFRESH_SECONDS)
                     continue
 
-                store.quality["coingecko"] = "成功"
-
-                # 2) 建 100 行（刪穩定幣：只用白名單精準比對）
-                rows: List[Row] = []
-                for item in top:
-                    sym = str(item.get("symbol", "")).upper()
-
-                    if is_stablecoin_symbol(sym):
-                        continue
-
-                    rank = int(item.get("market_cap_rank") or 0)
-                    price = float(item.get("current_price") or 0.0)
-                    mcap = float(item.get("market_cap") or 0.0)
-
-                    chg_1h = item.get("price_change_percentage_1h_in_currency")
-                    chg_24h = item.get("price_change_percentage_24h_in_currency")
-                    chg_1h = float(chg_1h) if chg_1h is not None else None
-                    chg_24h = float(chg_24h) if chg_24h is not None else None
-
-                    bsymbol = map_to_binance_symbol(sym)
-                    old = store.rows.get(sym)
-                    r = Row(
-                        rank=rank,
-                        symbol=sym,
-                        price_usd=price,
-                        market_cap_usd=mcap,
-                        chg_1h_pct=chg_1h,
-                        chg_24h_pct=chg_24h,
-                        binance_symbol=bsymbol,
-                        updated_at=now,
-                    )
-
-                    if old is not None:
-                        r.funding_rate_now = old.funding_rate_now
-                        r.funding_settle_delta_8h = old.funding_settle_delta_8h
-                        r.ls_ratio_now = old.ls_ratio_now
-                        r.ls_ratio_chg_1h = old.ls_ratio_chg_1h
-                        r.open_interest_now = old.open_interest_now
-                        r.open_interest_chg_1h = old.open_interest_chg_1h
-                        r.score_1to5 = old.score_1to5
-                        r.score_note = old.score_note
-
-                    rows.append(r)
+                for r in rows:
                     store.upsert(r)
 
                 keep = {r.symbol for r in rows}
@@ -830,7 +994,32 @@ async def refresh_loop():
                         except Exception:
                             pass
 
-                if store.usdt_perp_symbols:
+                if source_used == "coinglass":
+                    # Recompute score from whatever Coinglass metrics are available.
+                    for rw in rows:
+                        try:
+                            s, note = score_ac_1to5(
+                                rw.open_interest_chg_1h,
+                                rw.funding_rate_now,
+                                rw.ls_ratio_now,
+                                rw.ls_ratio_chg_1h,
+                            )
+                            rw.score_1to5 = s
+                            rw.score_note = note
+                        except Exception:
+                            pass
+
+                    data_phase2 = snapshot_from_store(now)
+                    await ws_manager.broadcast(
+                        {
+                            "type": "snapshot",
+                            "ts": now,
+                            "took_ms": int((time.time() - start) * 1000),
+                            "data": data_phase2,
+                            "quality": store.quality,
+                        }
+                    )
+                elif store.usdt_perp_symbols:
                     for i in range(0, len(rows), BINANCE_BATCH):
                         chunk = rows[i : i + BINANCE_BATCH]
                         tasks = [enrich_one(r) for r in chunk]
@@ -869,12 +1058,14 @@ async def refresh_loop():
 async def startup():
     load_dotenv()
     store.load_cache_from_disk()
+    use_coinglass = bool((os.getenv("COINGLASS_API_KEY") or "").strip())
 
     # 啟動先推快取：第一次開也秒出表格
     if store.last_good_snapshot:
         store.last_ts = store.last_good_ts
         store.quality["coingecko"] = "快取"
-        store.quality["binance"] = "未知"
+        store.quality["coinglass"] = "已啟用" if use_coinglass else "未設定 API Key"
+        store.quality["binance"] = "停用（改用 CoinGlass）" if use_coinglass else "未知"
         asyncio.create_task(
             ws_manager.broadcast(
                 {
@@ -887,7 +1078,10 @@ async def startup():
             )
         )
 
-    asyncio.create_task(binance_markprice_ws_loop())
+    if use_coinglass:
+        store.quality["binance_ws"] = "停用（改用 CoinGlass）"
+    else:
+        asyncio.create_task(binance_markprice_ws_loop())
     asyncio.create_task(refresh_loop())
 
 
@@ -1073,6 +1267,13 @@ HTML = r"""
   const lastEl = document.getElementById("last");
   const qualityEl = document.getElementById("quality");
   const errEl = document.getElementById("err");
+  function renderQuality(quality) {
+    const cgl = quality?.coinglass || "-";
+    const cg = quality?.coingecko || "-";
+    const bn = quality?.binance || "-";
+    const bws = quality?.binance_ws || "-";
+    qualityEl.textContent = `資料狀態：CoinGlass：${cgl}；CoinGecko：${cg}；Binance：${bn}；WS：${bws}`;
+  }
 
   const onlyFuturesEl = document.getElementById("onlyFutures");
   const searchEl      = document.getElementById("search");
@@ -1231,12 +1432,7 @@ HTML = r"""
       const took = msg.took_ms || 0;
       lastEl.textContent = `最後更新：${new Date(ts*1000).toLocaleString()}｜耗時：${took} ms`;
 
-      if (msg.quality) {
-        const cg = msg.quality.coingecko || "-";
-        const bn = msg.quality.binance || "-";
-        const bws = msg.quality.binance_ws || "-";
-        qualityEl.textContent = `資料狀態：CoinGecko：${cg}；Binance：${bn}；WS：${bws}`;
-      }
+      if (msg.quality) renderQuality(msg.quality);
 
       render();
       return;
@@ -1244,12 +1440,7 @@ HTML = r"""
 
     if (msg.type === "error") {
       errEl.textContent = msg.message || "資料更新失敗";
-      if (msg.quality) {
-        const cg = msg.quality.coingecko || "-";
-        const bn = msg.quality.binance || "-";
-        const bws = msg.quality.binance_ws || "-";
-        qualityEl.textContent = `資料狀態：CoinGecko：${cg}；Binance：${bn}；WS：${bws}`;
-      }
+      if (msg.quality) renderQuality(msg.quality);
     }
   };
 </script>
@@ -1325,6 +1516,7 @@ if __name__ == "__main__":
 
     print(f"[monitor] using http://{host}:{port}" + ("  (managed port)" if is_managed else "  (auto-picked)"))
     uvicorn.run(app, host=host, port=port, reload=False)
+
 
 
 
