@@ -4,12 +4,15 @@
 #   .\.venv\Scripts\python.exe -m pip install fastapi uvicorn httpx python-dotenv websockets
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urlencode
 
 import httpx
 from dotenv import load_dotenv
@@ -226,6 +229,14 @@ def coinglass_headers() -> Dict[str, str]:
     return headers
 
 
+def binance_headers() -> Dict[str, str]:
+    headers = {"User-Agent": "top100-monitor/2.4.1"}
+    api_key = (os.getenv("BINANCE_API_KEY") or "").strip()
+    if api_key:
+        headers["X-MBX-APIKEY"] = api_key
+    return headers
+
+
 async def safe_get_json(
     client: httpx.AsyncClient,
     url: str,
@@ -422,6 +433,26 @@ async def fetch_binance_usdt_perp_mapping(client: httpx.AsyncClient) -> Tuple[Di
     out.update(extra)
 
     return out, symbols_set, None
+
+
+async def fetch_binance_futures_auth_probe(client: httpx.AsyncClient) -> Optional[str]:
+    api_key = (os.getenv("BINANCE_API_KEY") or "").strip()
+    api_secret = (os.getenv("BINANCE_API_SECRET") or "").strip()
+    if not api_key or not api_secret:
+        return "未設定 BINANCE_API_KEY/SECRET"
+
+    try:
+        params = {"timestamp": int(time.time() * 1000), "recvWindow": 5000}
+        qs = urlencode(params)
+        sig = hmac.new(api_secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
+        url = f"{BINANCE_FAPI}/fapi/v2/balance?{qs}&signature={sig}"
+        r = await client.get(url, timeout=15)
+        if r.status_code == 200:
+            return "auth ok"
+        text = (r.text or "").strip().replace("\n", " ")
+        return f"auth {r.status_code}: {text[:90]}"
+    except Exception as e:
+        return f"auth error: {str(e)[:90]}"
 
 
 def map_to_binance_symbol(sym: str) -> Optional[str]:
@@ -723,7 +754,7 @@ async def refresh_loop():
     async with httpx.AsyncClient(headers=headers) as cg_client, httpx.AsyncClient(
         headers=coinglass_headers()
     ) as cgl_client, httpx.AsyncClient(
-        headers={"User-Agent": "top100-monitor/2.4.1"}
+        headers=binance_headers()
     ) as bn_client:
         if use_coinglass:
             store.base_to_usdt_perp = {}
@@ -738,7 +769,8 @@ async def refresh_loop():
                 if err:
                     store.base_to_usdt_perp = {}
                     store.usdt_perp_symbols = set()
-                    store.quality["binance"] = f"映射失敗(已降級): {err[:80]}"
+                    auth_probe = await fetch_binance_futures_auth_probe(bn_client)
+                    store.quality["binance"] = f"映射失敗(已降級): {err[:55]} | {auth_probe[:55]}"
                 else:
                     store.base_to_usdt_perp = m
                     store.usdt_perp_symbols = symbols_set
@@ -1516,7 +1548,6 @@ if __name__ == "__main__":
 
     print(f"[monitor] using http://{host}:{port}" + ("  (managed port)" if is_managed else "  (auto-picked)"))
     uvicorn.run(app, host=host, port=port, reload=False)
-
 
 
 
