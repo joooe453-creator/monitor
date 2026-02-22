@@ -626,7 +626,7 @@ async def refresh_loop():
             if err:
                 store.base_to_usdt_perp = {}
                 store.usdt_perp_symbols = set()
-                store.quality["binance"] = "映射失敗(已降級)"
+                store.quality["binance"] = f"映射失敗(已降級): {err[:80]}"
             else:
                 store.base_to_usdt_perp = m
                 store.usdt_perp_symbols = symbols_set
@@ -634,7 +634,7 @@ async def refresh_loop():
         except Exception:
             store.base_to_usdt_perp = {}
             store.usdt_perp_symbols = set()
-            store.quality["binance"] = "映射失敗(已降級)"
+            store.quality["binance"] = "映射失敗(已降級): exception"
 
         sem = asyncio.Semaphore(BINANCE_CONCURRENCY)
 
@@ -1130,7 +1130,8 @@ HTML = r"""
     const sat = 65;
     const light = 96 - t * 22;
     const bg = `hsl(${hue} ${sat}% ${light}%)`;
-    return `background:${bg};`;
+    const fg = "#0b1424";
+    return `background:${bg}; color:${fg}; text-shadow:none;`;
   }
 
   function heatText(pct) {
@@ -1324,7 +1325,6 @@ if __name__ == "__main__":
 
     print(f"[monitor] using http://{host}:{port}" + ("  (managed port)" if is_managed else "  (auto-picked)"))
     uvicorn.run(app, host=host, port=port, reload=False)
-
 
 
 
