@@ -665,7 +665,22 @@ async def refresh_loop():
                         )
                     else:
                         store.quality["coingecko"] = "失敗"
-                        await ws_manager.broadcast({"type": "error", "message": f"CoinGecko 取資料失敗：{cg_err}"})
+                        await ws_manager.broadcast(
+                            {
+                                "type": "snapshot",
+                                "ts": now,
+                                "took_ms": int((time.time() - start) * 1000),
+                                "data": [],
+                                "quality": store.quality,
+                            }
+                        )
+                        await ws_manager.broadcast(
+                            {
+                                "type": "error",
+                                "message": f"CoinGecko 取資料失敗：{cg_err}",
+                                "quality": store.quality,
+                            }
+                        )
 
                     await asyncio.sleep(REFRESH_SECONDS)
                     continue
@@ -837,7 +852,13 @@ async def refresh_loop():
             except Exception as loop_err:
                 # Keep the service alive even if one cycle crashes unexpectedly.
                 store.quality["coingecko"] = f"失敗({type(loop_err).__name__})"
-                await ws_manager.broadcast({"type": "error", "message": f"刷新循環失敗：{loop_err}"})
+                await ws_manager.broadcast(
+                    {
+                        "type": "error",
+                        "message": f"刷新循環失敗：{loop_err}",
+                        "quality": store.quality,
+                    }
+                )
                 await asyncio.sleep(REFRESH_SECONDS)
 
 
@@ -980,6 +1001,7 @@ HTML = r"""
     <div>連線狀態：<span id="wsPill" class="pill off">連線中…</span></div>
     <div class="small" id="last">正在載入資料中…</div>
     <div class="small" id="quality"></div>
+    <div class="small" id="err" style="color:#ffb3b3;"></div>
   </div>
 
   <div class="controls">
@@ -1050,6 +1072,7 @@ HTML = r"""
   const wsPill = document.getElementById("wsPill");
   const lastEl = document.getElementById("last");
   const qualityEl = document.getElementById("quality");
+  const errEl = document.getElementById("err");
 
   const onlyFuturesEl = document.getElementById("onlyFutures");
   const searchEl      = document.getElementById("search");
@@ -1201,6 +1224,7 @@ HTML = r"""
     const msg = JSON.parse(ev.data);
 
     if (msg.type === "snapshot") {
+      errEl.textContent = "";
       latestRows = msg.data || [];
       const ts = msg.ts || Math.floor(Date.now()/1000);
       const took = msg.took_ms || 0;
@@ -1214,6 +1238,17 @@ HTML = r"""
       }
 
       render();
+      return;
+    }
+
+    if (msg.type === "error") {
+      errEl.textContent = msg.message || "資料更新失敗";
+      if (msg.quality) {
+        const cg = msg.quality.coingecko || "-";
+        const bn = msg.quality.binance || "-";
+        const bws = msg.quality.binance_ws || "-";
+        qualityEl.textContent = `資料狀態：CoinGecko：${cg}；Binance：${bn}；WS：${bws}`;
+      }
     }
   };
 </script>
@@ -1289,6 +1324,7 @@ if __name__ == "__main__":
 
     print(f"[monitor] using http://{host}:{port}" + ("  (managed port)" if is_managed else "  (auto-picked)"))
     uvicorn.run(app, host=host, port=port, reload=False)
+
 
 
 
