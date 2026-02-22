@@ -326,10 +326,11 @@ def map_to_binance_symbol(sym: str) -> Optional[str]:
     s = sym.upper()
     if s in store.base_to_usdt_perp:
         return store.base_to_usdt_perp[s]
+    # If mapping is unavailable (e.g. region/IP blocked), disable Binance enrich gracefully.
+    if not store.usdt_perp_symbols:
+        return None
     cand = f"{s}{QUOTE_ASSET}"
-    if store.usdt_perp_symbols:
-        return cand if cand in store.usdt_perp_symbols else None
-    return cand
+    return cand if cand in store.usdt_perp_symbols else None
 
 
 # =========================
@@ -619,13 +620,13 @@ async def refresh_loop():
     async with httpx.AsyncClient(headers=headers) as cg_client, httpx.AsyncClient(
         headers={"User-Agent": "top100-monitor/2.4.1"}
     ) as bn_client:
-        # Binance mapping
+        # Binance mapping (best-effort; failure should not block CoinGecko rows)
         try:
             m, symbols_set, err = await fetch_binance_usdt_perp_mapping(bn_client)
             if err:
                 store.base_to_usdt_perp = {}
                 store.usdt_perp_symbols = set()
-                store.quality["binance"] = "映射失敗"
+                store.quality["binance"] = "映射失敗(已降級)"
             else:
                 store.base_to_usdt_perp = m
                 store.usdt_perp_symbols = symbols_set
@@ -633,214 +634,211 @@ async def refresh_loop():
         except Exception:
             store.base_to_usdt_perp = {}
             store.usdt_perp_symbols = set()
-            store.quality["binance"] = "映射失敗"
+            store.quality["binance"] = "映射失敗(已降級)"
 
         sem = asyncio.Semaphore(BINANCE_CONCURRENCY)
 
         while True:
-            start = time.time()
-            now = int(time.time())
+            try:
+                start = time.time()
+                now = int(time.time())
 
-            # WS 狀態縮短顯示
-            if store.ws_last_update_ts > 0 and store.quality.get("binance_ws", "").startswith("已連線"):
-                age = now - store.ws_last_update_ts
-                store.quality["binance_ws"] = "已連線" if age <= 6 else f"已連線({age}s)"
+                # WS 狀態縮短顯示
+                if store.ws_last_update_ts > 0 and store.quality.get("binance_ws", "").startswith("已連線"):
+                    age = now - store.ws_last_update_ts
+                    store.quality["binance_ws"] = "已連線" if age <= 6 else f"已連線({age}s)"
 
-            # 1) CoinGecko
-            top, cg_err = await fetch_coingecko_top100(cg_client)
+                # 1) CoinGecko
+                top, cg_err = await fetch_coingecko_top100(cg_client)
 
-            if top is None:
-                if store.last_good_snapshot:
-                    store.quality["coingecko"] = "快取"
+                if top is None:
+                    if store.last_good_snapshot:
+                        store.quality["coingecko"] = "快取"
+                        await ws_manager.broadcast(
+                            {
+                                "type": "snapshot",
+                                "ts": store.last_good_ts,
+                                "took_ms": 0,
+                                "data": store.last_good_snapshot,
+                                "quality": store.quality,
+                            }
+                        )
+                    else:
+                        store.quality["coingecko"] = "失敗"
+                        await ws_manager.broadcast({"type": "error", "message": f"CoinGecko 取資料失敗：{cg_err}"})
+
+                    await asyncio.sleep(REFRESH_SECONDS)
+                    continue
+
+                store.quality["coingecko"] = "成功"
+
+                # 2) 建 100 行（刪穩定幣：只用白名單精準比對）
+                rows: List[Row] = []
+                for item in top:
+                    sym = str(item.get("symbol", "")).upper()
+
+                    if is_stablecoin_symbol(sym):
+                        continue
+
+                    rank = int(item.get("market_cap_rank") or 0)
+                    price = float(item.get("current_price") or 0.0)
+                    mcap = float(item.get("market_cap") or 0.0)
+
+                    chg_1h = item.get("price_change_percentage_1h_in_currency")
+                    chg_24h = item.get("price_change_percentage_24h_in_currency")
+                    chg_1h = float(chg_1h) if chg_1h is not None else None
+                    chg_24h = float(chg_24h) if chg_24h is not None else None
+
+                    bsymbol = map_to_binance_symbol(sym)
+                    old = store.rows.get(sym)
+                    r = Row(
+                        rank=rank,
+                        symbol=sym,
+                        price_usd=price,
+                        market_cap_usd=mcap,
+                        chg_1h_pct=chg_1h,
+                        chg_24h_pct=chg_24h,
+                        binance_symbol=bsymbol,
+                        updated_at=now,
+                    )
+
+                    if old is not None:
+                        r.funding_rate_now = old.funding_rate_now
+                        r.funding_settle_delta_8h = old.funding_settle_delta_8h
+                        r.ls_ratio_now = old.ls_ratio_now
+                        r.ls_ratio_chg_1h = old.ls_ratio_chg_1h
+                        r.open_interest_now = old.open_interest_now
+                        r.open_interest_chg_1h = old.open_interest_chg_1h
+                        r.score_1to5 = old.score_1to5
+                        r.score_note = old.score_note
+
+                    rows.append(r)
+                    store.upsert(r)
+
+                keep = {r.symbol for r in rows}
+                for k in list(store.rows.keys()):
+                    if k not in keep:
+                        store.rows.pop(k, None)
+
+                store.last_ts = now
+
+                data_phase1 = snapshot_from_store(now)
+                store.last_good_snapshot = data_phase1
+                store.last_good_ts = now
+                store.save_cache_to_disk(now, data_phase1)
+
+                await ws_manager.broadcast(
+                    {
+                        "type": "snapshot",
+                        "ts": now,
+                        "took_ms": int((time.time() - start) * 1000),
+                        "data": data_phase1,
+                        "quality": store.quality,
+                    }
+                )
+
+                async def enrich_one(rw: Row):
+                    if not rw.binance_symbol:
+                        rw.funding_rate_now = None
+                        rw.funding_settle_delta_8h = None
+                        rw.ls_ratio_now = None
+                        rw.ls_ratio_chg_1h = None
+                        rw.open_interest_now = None
+                        rw.open_interest_chg_1h = None
+                        rw.score_1to5 = None
+                        rw.score_note = None
+                        return
+
+                    async with sem:
+                        try:
+                            hit = store.ws_funding.get(rw.binance_symbol.upper())
+                            if hit is not None:
+                                _, fr = hit
+                                rw.funding_rate_now = fr
+                            else:
+                                rw.funding_rate_now = await fetch_funding_now_premium_index(bn_client, rw.binance_symbol)
+                        except Exception:
+                            pass
+
+                        try:
+                            bts = store._bucket_ts(now)
+                            last_b = store.funding_settle_last_fetch_bucket.get(rw.symbol)
+                            if last_b != bts:
+                                store.funding_settle_last_fetch_bucket[rw.symbol] = bts
+                                rw.funding_settle_delta_8h = await fetch_funding_settle_delta_8h(bn_client, rw.binance_symbol)
+                        except Exception:
+                            pass
+
+                        try:
+                            if not (store.ls_buckets.get(rw.symbol) or {}):
+                                series = await fetch_ls_ratio_5m_series(bn_client, rw.binance_symbol, limit=BOOTSTRAP_LIMIT)
+                                for ts_s, val in series:
+                                    store.push_bucket(store.ls_buckets, rw.symbol, ts_s, val)
+
+                            latest_ls = await fetch_ls_ratio_5m_latest_point(bn_client, rw.binance_symbol)
+                            if latest_ls is not None:
+                                ts_s, val = latest_ls
+                                rw.ls_ratio_now = val
+                                store.push_bucket(store.ls_buckets, rw.symbol, ts_s, val)
+
+                            rw.ls_ratio_chg_1h = store.change_1h_or_none(store.ls_buckets, rw.symbol, now)
+                        except Exception:
+                            pass
+
+                        try:
+                            if not (store.oi_buckets.get(rw.symbol) or {}):
+                                series = await fetch_open_interest_hist_5m_series(bn_client, rw.binance_symbol, limit=BOOTSTRAP_LIMIT)
+                                for ts_s, val in series:
+                                    store.push_bucket(store.oi_buckets, rw.symbol, ts_s, val)
+                                if series:
+                                    rw.open_interest_now = series[-1][1]
+                            else:
+                                series = await fetch_open_interest_hist_5m_series(bn_client, rw.binance_symbol, limit=1)
+                                if series:
+                                    ts_s, val = series[-1]
+                                    rw.open_interest_now = val
+                                    store.push_bucket(store.oi_buckets, rw.symbol, ts_s, val)
+
+                            rw.open_interest_chg_1h = store.change_1h_or_none(store.oi_buckets, rw.symbol, now)
+                        except Exception:
+                            pass
+
+                        try:
+                            s, note = score_ac_1to5(
+                                rw.open_interest_chg_1h,
+                                rw.funding_rate_now,
+                                rw.ls_ratio_now,
+                                rw.ls_ratio_chg_1h,
+                            )
+                            rw.score_1to5 = s
+                            rw.score_note = note
+                        except Exception:
+                            pass
+
+                if store.usdt_perp_symbols:
+                    for i in range(0, len(rows), BINANCE_BATCH):
+                        chunk = rows[i : i + BINANCE_BATCH]
+                        tasks = [enrich_one(r) for r in chunk]
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        await asyncio.sleep(BINANCE_BATCH_SLEEP)
+
+                    data_phase2 = snapshot_from_store(now)
                     await ws_manager.broadcast(
                         {
                             "type": "snapshot",
-                            "ts": store.last_good_ts,
-                            "took_ms": 0,
-                            "data": store.last_good_snapshot,
+                            "ts": now,
+                            "took_ms": int((time.time() - start) * 1000),
+                            "data": data_phase2,
                             "quality": store.quality,
                         }
                     )
-                else:
-                    store.quality["coingecko"] = "失敗"
-                    await ws_manager.broadcast({"type": "error", "message": f"CoinGecko 取資料失敗：{cg_err}"})
 
                 await asyncio.sleep(REFRESH_SECONDS)
-                continue
-
-            store.quality["coingecko"] = "成功"
-
-            # 2) 建 100 行（刪穩定幣：只用白名單精準比對）
-            rows: List[Row] = []
-            for item in top:
-                sym = str(item.get("symbol", "")).upper()
-
-                # 只刪穩定幣（低誤殺：精準比對）
-                if is_stablecoin_symbol(sym):
-                    continue
-
-                rank = int(item.get("market_cap_rank") or 0)
-                price = float(item.get("current_price") or 0.0)
-                mcap = float(item.get("market_cap") or 0.0)
-
-                chg_1h = item.get("price_change_percentage_1h_in_currency")
-                chg_24h = item.get("price_change_percentage_24h_in_currency")
-                chg_1h = float(chg_1h) if chg_1h is not None else None
-                chg_24h = float(chg_24h) if chg_24h is not None else None
-
-                bsymbol = map_to_binance_symbol(sym)
-
-                old = store.rows.get(sym)
-                r = Row(
-                    rank=rank,
-                    symbol=sym,
-                    price_usd=price,
-                    market_cap_usd=mcap,
-                    chg_1h_pct=chg_1h,
-                    chg_24h_pct=chg_24h,
-                    binance_symbol=bsymbol,
-                    updated_at=now,
-                )
-
-                if old is not None:
-                    r.funding_rate_now = old.funding_rate_now
-                    r.funding_settle_delta_8h = old.funding_settle_delta_8h
-                    r.ls_ratio_now = old.ls_ratio_now
-                    r.ls_ratio_chg_1h = old.ls_ratio_chg_1h
-                    r.open_interest_now = old.open_interest_now
-                    r.open_interest_chg_1h = old.open_interest_chg_1h
-                    r.score_1to5 = old.score_1to5
-                    r.score_note = old.score_note
-
-                rows.append(r)
-                store.upsert(r)
-
-            # 同步刪掉 store 中已不在本輪的（避免前端殘留）
-            keep = {r.symbol for r in rows}
-            for k in list(store.rows.keys()):
-                if k not in keep:
-                    store.rows.pop(k, None)
-
-            store.last_ts = now
-
-            # 2.1 phase1 broadcast（首屏快）
-            data_phase1 = snapshot_from_store(now)
-            store.last_good_snapshot = data_phase1
-            store.last_good_ts = now
-            store.save_cache_to_disk(now, data_phase1)
-
-            await ws_manager.broadcast(
-                {
-                    "type": "snapshot",
-                    "ts": now,
-                    "took_ms": int((time.time() - start) * 1000),
-                    "data": data_phase1,
-                    "quality": store.quality,
-                }
-            )
-
-            # 3) phase2 enrich：分批、限速
-            async def enrich_one(rw: Row):
-                if not rw.binance_symbol:
-                    rw.funding_rate_now = None
-                    rw.funding_settle_delta_8h = None
-                    rw.ls_ratio_now = None
-                    rw.ls_ratio_chg_1h = None
-                    rw.open_interest_now = None
-                    rw.open_interest_chg_1h = None
-                    rw.score_1to5 = None
-                    rw.score_note = None
-                    return
-
-                async with sem:
-                    # funding now：先 WS 命中，沒命中才 premiumIndex
-                    try:
-                        hit = store.ws_funding.get(rw.binance_symbol.upper())
-                        if hit is not None:
-                            _, fr = hit
-                            rw.funding_rate_now = fr
-                        else:
-                            rw.funding_rate_now = await fetch_funding_now_premium_index(bn_client, rw.binance_symbol)
-                    except Exception:
-                        pass
-
-                    # funding settle delta 8h：每幣每 bucket 抓一次
-                    try:
-                        bts = store._bucket_ts(now)
-                        last_b = store.funding_settle_last_fetch_bucket.get(rw.symbol)
-                        if last_b != bts:
-                            store.funding_settle_last_fetch_bucket[rw.symbol] = bts
-                            rw.funding_settle_delta_8h = await fetch_funding_settle_delta_8h(bn_client, rw.binance_symbol)
-                    except Exception:
-                        pass
-
-                    # 多空比：啟動補 13 筆（只做一次）+ 最新點
-                    try:
-                        if not (store.ls_buckets.get(rw.symbol) or {}):
-                            series = await fetch_ls_ratio_5m_series(bn_client, rw.binance_symbol, limit=BOOTSTRAP_LIMIT)
-                            for ts_s, val in series:
-                                store.push_bucket(store.ls_buckets, rw.symbol, ts_s, val)
-
-                        latest_ls = await fetch_ls_ratio_5m_latest_point(bn_client, rw.binance_symbol)
-                        if latest_ls is not None:
-                            ts_s, val = latest_ls
-                            rw.ls_ratio_now = val
-                            store.push_bucket(store.ls_buckets, rw.symbol, ts_s, val)
-
-                        rw.ls_ratio_chg_1h = store.change_1h_or_none(store.ls_buckets, rw.symbol, now)
-                    except Exception:
-                        pass
-
-                    # 持倉量：啟動先用 openInterestHist 13 筆一次到位（更快出現 1h 變化量）
-                    try:
-                        if not (store.oi_buckets.get(rw.symbol) or {}):
-                            series = await fetch_open_interest_hist_5m_series(bn_client, rw.binance_symbol, limit=BOOTSTRAP_LIMIT)
-                            for ts_s, val in series:
-                                store.push_bucket(store.oi_buckets, rw.symbol, ts_s, val)
-                            if series:
-                                rw.open_interest_now = series[-1][1]
-                        else:
-                            series = await fetch_open_interest_hist_5m_series(bn_client, rw.binance_symbol, limit=1)
-                            if series:
-                                ts_s, val = series[-1]
-                                rw.open_interest_now = val
-                                store.push_bucket(store.oi_buckets, rw.symbol, ts_s, val)
-
-                        rw.open_interest_chg_1h = store.change_1h_or_none(store.oi_buckets, rw.symbol, now)
-                    except Exception:
-                        pass
-
-                    # A + C 分數（只針對 OI 1h 上升）
-                    try:
-                        s, note = score_ac_1to5(
-                            rw.open_interest_chg_1h,
-                            rw.funding_rate_now,
-                            rw.ls_ratio_now,
-                            rw.ls_ratio_chg_1h,
-                        )
-                        rw.score_1to5 = s
-                        rw.score_note = note
-                    except Exception:
-                        pass
-
-            for i in range(0, len(rows), BINANCE_BATCH):
-                chunk = rows[i : i + BINANCE_BATCH]
-                tasks = [enrich_one(r) for r in chunk]
-                await asyncio.gather(*tasks, return_exceptions=True)
-                await asyncio.sleep(BINANCE_BATCH_SLEEP)
-
-            data_phase2 = snapshot_from_store(now)
-            await ws_manager.broadcast(
-                {
-                    "type": "snapshot",
-                    "ts": now,
-                    "took_ms": int((time.time() - start) * 1000),
-                    "data": data_phase2,
-                    "quality": store.quality,
-                }
-            )
-
-            await asyncio.sleep(REFRESH_SECONDS)
+            except Exception as loop_err:
+                # Keep the service alive even if one cycle crashes unexpectedly.
+                store.quality["coingecko"] = f"失敗({type(loop_err).__name__})"
+                await ws_manager.broadcast({"type": "error", "message": f"刷新循環失敗：{loop_err}"})
+                await asyncio.sleep(REFRESH_SECONDS)
 
 
 # =========================
